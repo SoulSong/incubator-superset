@@ -1,3 +1,4 @@
+/* eslint-disable no-console */
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -16,22 +17,21 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-const os = require('os');
+const fs = require('fs');
 const path = require('path');
 const webpack = require('webpack');
-const BundleAnalyzerPlugin = require('webpack-bundle-analyzer')
-  .BundleAnalyzerPlugin;
+const { BundleAnalyzerPlugin } = require('webpack-bundle-analyzer');
 const { CleanWebpackPlugin } = require('clean-webpack-plugin');
 const CopyPlugin = require('copy-webpack-plugin');
 const MiniCssExtractPlugin = require('mini-css-extract-plugin');
 const OptimizeCSSAssetsPlugin = require('optimize-css-assets-webpack-plugin');
 const SpeedMeasurePlugin = require('speed-measure-webpack-plugin');
 const TerserPlugin = require('terser-webpack-plugin');
-const WebpackAssetsManifest = require('webpack-assets-manifest');
+const ManifestPlugin = require('webpack-manifest-plugin');
 const ForkTsCheckerWebpackPlugin = require('fork-ts-checker-webpack-plugin');
-
-// Parse command-line arguments
-const parsedArgs = require('minimist')(process.argv.slice(2));
+const parsedArgs = require('yargs').argv;
+const getProxyConfig = require('./webpack.proxy-config');
+const packageConfig = require('./package.json');
 
 // input dir
 const APP_DIR = path.resolve(__dirname, './');
@@ -41,23 +41,57 @@ const BUILD_DIR = path.resolve(__dirname, '../superset/static/assets');
 const {
   mode = 'development',
   devserverPort = 9000,
-  supersetPort = 8088,
   measure = false,
   analyzeBundle = false,
 } = parsedArgs;
-
 const isDevMode = mode !== 'production';
+
+const output = {
+  path: BUILD_DIR,
+  publicPath: '/static/assets/', // necessary for lazy-loaded chunks
+};
+if (isDevMode) {
+  output.filename = '[name].[hash:8].entry.js';
+  output.chunkFilename = '[name].[hash:8].chunk.js';
+} else {
+  output.filename = '[name].[chunkhash].entry.js';
+  output.chunkFilename = '[name].[chunkhash].chunk.js';
+}
 
 const plugins = [
   // creates a manifest.json mapping of name to hashed output used in template files
-  new WebpackAssetsManifest({
-    publicPath: true,
+  new ManifestPlugin({
+    publicPath: output.publicPath,
+    seed: { app: 'superset' },
     // This enables us to include all relevant files for an entry
-    entrypoints: true,
+    generate: (seed, files, entrypoints) => {
+      // Each entrypoint's chunk files in the format of
+      // {
+      //   entry: {
+      //     css: [],
+      //     js: []
+      //   }
+      // }
+      const entryFiles = {};
+      for (const [entry, chunks] of Object.entries(entrypoints)) {
+        entryFiles[entry] = {
+          css: chunks
+            .filter(x => x.endsWith('.css'))
+            .map(x => path.join(output.publicPath, x)),
+          js: chunks
+            .filter(x => x.endsWith('.js'))
+            .map(x => path.join(output.publicPath, x)),
+        };
+      }
+      return {
+        ...seed,
+        entrypoints: entryFiles,
+      };
+    },
     // Also write to disk when using devServer
     // instead of only keeping manifest.json in memory
     // This is required to make devServer work with flask.
-    writeToDisk: isDevMode,
+    writeToFileEmit: isDevMode,
   }),
 
   // create fresh dist/ upon build
@@ -74,23 +108,22 @@ const plugins = [
 
   // runs type checking on a separate process to speed up the build
   new ForkTsCheckerWebpackPlugin({
+    eslint: true,
     checkSyntacticErrors: true,
   }),
 
-  new CopyPlugin(
-    [
+  new CopyPlugin({
+    patterns: [
       'package.json',
       { from: 'images', to: 'images' },
       { from: 'stylesheets', to: 'stylesheets' },
     ],
-    { copyUnmodified: true },
-  ),
+  }),
 ];
-
-if (isDevMode) {
-  // Enable hot module replacement
-  plugins.push(new webpack.HotModuleReplacementPlugin());
-} else {
+if (!process.env.CI) {
+  plugins.push(new webpack.ProgressPlugin());
+}
+if (!isDevMode) {
   // text loading (webpack 4+)
   plugins.push(
     new MiniCssExtractPlugin({
@@ -101,42 +134,67 @@ if (isDevMode) {
   plugins.push(new OptimizeCSSAssetsPlugin());
 }
 
-const output = {
-  path: BUILD_DIR,
-  publicPath: '/static/assets/', // necessary for lazy-loaded chunks
-};
-
+const PREAMBLE = [path.join(APP_DIR, '/src/preamble.ts')];
 if (isDevMode) {
-  output.filename = '[name].[hash:8].entry.js';
-  output.chunkFilename = '[name].[hash:8].chunk.js';
-} else {
-  output.filename = '[name].[chunkhash].entry.js';
-  output.chunkFilename = '[name].[chunkhash].chunk.js';
+  // A Superset webpage normally includes two JS bundles in dev, `theme.ts` and
+  // the main entrypoint. Only the main entry should have the dev server client,
+  // otherwise the websocket client will initialize twice, creating two sockets.
+  // Ref: https://github.com/gaearon/react-hot-loader/issues/141
+  PREAMBLE.unshift(
+    `webpack-dev-server/client?http://localhost:${devserverPort}`,
+  );
 }
-
-const PREAMBLE = ['babel-polyfill', path.join(APP_DIR, '/src/preamble.js')];
 
 function addPreamble(entry) {
   return PREAMBLE.concat([path.join(APP_DIR, entry)]);
 }
+
+const babelLoader = {
+  loader: 'babel-loader',
+  options: {
+    cacheDirectory: true,
+    // disable gzip compression for cache files
+    // faster when there are millions of small files
+    cacheCompression: false,
+    plugins: ['emotion'],
+    presets: [
+      [
+        '@emotion/babel-preset-css-prop',
+        {
+          autoLabel: true,
+          labelFormat: '[local]',
+        },
+      ],
+    ],
+  },
+};
 
 const config = {
   node: {
     fs: 'empty',
   },
   entry: {
-    theme: path.join(APP_DIR, '/src/theme.js'),
+    theme: path.join(APP_DIR, '/src/theme.ts'),
     preamble: PREAMBLE,
-    addSlice: addPreamble('/src/addSlice/index.jsx'),
+    addSlice: addPreamble('/src/addSlice/index.tsx'),
     explore: addPreamble('/src/explore/index.jsx'),
     dashboard: addPreamble('/src/dashboard/index.jsx'),
-    sqllab: addPreamble('/src/SqlLab/index.jsx'),
-    welcome: addPreamble('/src/welcome/index.jsx'),
-    profile: addPreamble('/src/profile/index.jsx'),
+    sqllab: addPreamble('/src/SqlLab/index.tsx'),
+    crudViews: addPreamble('/src/views/index.tsx'),
+    menu: addPreamble('src/views/menu.tsx'),
+    profile: addPreamble('/src/profile/index.tsx'),
     showSavedQuery: [path.join(APP_DIR, '/src/showSavedQuery/index.jsx')],
   },
   output,
+  stats: 'minimal',
+  performance: {
+    assetFilter(assetFilename) {
+      // don't throw size limit warning on geojson and font files
+      return !/\.(map|geojson|woff2)$/.test(assetFilename);
+    },
+  },
   optimization: {
+    sideEffects: true,
     splitChunks: {
       chunks: 'all',
       automaticNameDelimiter: '-',
@@ -145,7 +203,7 @@ const config = {
         default: false,
         major: {
           name: 'vendors-major',
-          test: /[\\/]node_modules\/(brace|react[-]dom|@superset[-]ui\/translation)[\\/]/,
+          test: /\/node_modules\/(brace|react|react-dom|@superset-ui\/translation|webpack.*|@babel.*)\//,
         },
       },
     },
@@ -153,6 +211,10 @@ const config = {
   resolve: {
     alias: {
       src: path.resolve(APP_DIR, './src'),
+      'react-dom': '@hot-loader/react-dom',
+      stylesheets: path.resolve(APP_DIR, './stylesheets'),
+      images: path.resolve(APP_DIR, './images'),
+      spec: path.resolve(APP_DIR, './spec'),
     },
     extensions: ['.ts', '.tsx', '.js', '.jsx'],
     symlinks: false,
@@ -169,67 +231,44 @@ const config = {
       },
       {
         test: /\.tsx?$/,
+        exclude: [/\.test.tsx?$/],
         use: [
-          { loader: 'cache-loader' },
-          {
-            loader: 'thread-loader',
-            options: {
-              // there should be 1 cpu for the fork-ts-checker-webpack-plugin
-              workers: os.cpus().length - 1,
-            },
-          },
+          'thread-loader',
+          babelLoader,
           {
             loader: 'ts-loader',
             options: {
               // transpile only in happyPack mode
               // type checking is done via fork-ts-checker-webpack-plugin
               happyPackMode: true,
+              transpileOnly: true,
+              // must override compiler options here, even though we have set
+              // the same options in `tsconfig.json`, because they may still
+              // be overriden by `tsconfig.json` in node_modules subdirectories.
+              compilerOptions: {
+                esModuleInterop: false,
+                importHelpers: false,
+                module: 'esnext',
+                target: 'esnext',
+              },
             },
           },
         ],
       },
       {
         test: /\.jsx?$/,
-        exclude: /node_modules/,
-        include: APP_DIR,
-        loader: 'babel-loader',
-      },
-      {
-        // handle symlinked modules
-        // for debugging @superset-ui packages via npm link
-        test: /\.jsx?$/,
-        include: /node_modules\/[@]superset[-]ui.+\/src/,
-        use: [
-          {
-            loader: 'babel-loader',
-            options: {
-              presets: [
-                'airbnb',
-                '@babel/preset-react',
-                [
-                  '@babel/preset-env',
-                  {
-                    useBuiltIns: 'usage',
-                    corejs: 3,
-                    loose: true,
-                    modules: false,
-                    shippedProposals: true,
-                  },
-                ],
-              ],
-              plugins: [
-                'lodash',
-                '@babel/plugin-syntax-dynamic-import',
-                'react-hot-loader/babel',
-                ['@babel/plugin-transform-runtime', { corejs: 3 }],
-              ],
-            },
-          },
+        // include source code for plugins, but exclude node_modules and test files within them
+        exclude: [/superset-ui.*\/node_modules\//, /\.test.jsx?$/],
+        include: [
+          new RegExp(`${APP_DIR}/src`),
+          /superset-ui.*\/src/,
+          new RegExp(`${APP_DIR}/.storybook`),
         ],
+        use: [babelLoader],
       },
       {
         test: /\.css$/,
-        include: [APP_DIR, /superset[-]ui.+\/src/],
+        include: [APP_DIR, /superset-ui.+\/src/],
         use: [
           isDevMode ? 'style-loader' : MiniCssExtractPlugin.loader,
           {
@@ -255,6 +294,7 @@ const config = {
             loader: 'less-loader',
             options: {
               sourceMap: isDevMode,
+              javascriptEnabled: true,
             },
           },
         ],
@@ -267,6 +307,13 @@ const config = {
           limit: 10000,
           name: '[name].[hash:8].[ext]',
         },
+      },
+      {
+        test: /\.svg(\?v=\d+\.\d+\.\d+)?$/,
+        issuer: {
+          test: /\.(j|t)sx?$/,
+        },
+        use: ['@svgr/webpack'],
       },
       {
         test: /\.(jpg|gif)$/,
@@ -292,27 +339,58 @@ const config = {
     'react/lib/ReactContext': true,
   },
   plugins,
-  devtool: isDevMode ? 'cheap-module-eval-source-map' : false,
-  devServer: {
+  devtool: false,
+};
+
+let proxyConfig = getProxyConfig();
+
+if (isDevMode) {
+  config.devtool = 'eval-cheap-module-source-map';
+  config.devServer = {
+    before(app, server, compiler) {
+      // load proxy config when manifest updates
+      const hook = compiler.hooks.webpackManifestPluginAfterEmit;
+      hook.tap('ManifestPlugin', manifest => {
+        proxyConfig = getProxyConfig(manifest);
+      });
+    },
     historyApiFallback: true,
     hot: true,
-    index: '', // This line is needed to enable root proxying
+    injectClient: false,
+    injectHot: true,
     inline: true,
     stats: 'minimal',
     overlay: true,
     port: devserverPort,
     // Only serves bundled files from webpack-dev-server
     // and proxy everything else to Superset backend
-    proxy: {
-      context: () => true,
-      '/': `http://localhost:${supersetPort}`,
-      target: `http://localhost:${supersetPort}`,
-    },
+    proxy: [
+      // functions are called for every request
+      () => {
+        return proxyConfig;
+      },
+    ],
     contentBase: path.join(process.cwd(), '../static/assets'),
-  },
-};
+  };
 
-if (!isDevMode) {
+  // find all the symlinked plugins and use their source code for imports
+  let hasSymlink = false;
+  for (const [pkg, version] of Object.entries(packageConfig.dependencies)) {
+    const srcPath = `./node_modules/${pkg}/src`;
+    if (/superset-ui/.test(pkg) && fs.existsSync(srcPath)) {
+      console.log(
+        `[Superset Plugin] Use symlink source for ${pkg} @ ${version}`,
+      );
+      // only allow exact match so imports like `@superset-ui/plugin-name/lib`
+      // and `@superset-ui/plugin-name/esm` can still work.
+      config.resolve.alias[`${pkg}$`] = `${pkg}/src`;
+      hasSymlink = true;
+    }
+  }
+  if (hasSymlink) {
+    console.log(''); // pure cosmetic new line
+  }
+} else {
   config.optimization.minimizer = [
     new TerserPlugin({
       cache: '.terser-plugin-cache/',

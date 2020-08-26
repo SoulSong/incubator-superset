@@ -41,9 +41,9 @@ from .helpers import (
 )
 
 
-def load_world_bank_health_n_pop(
-    only_metadata=False, force=False
-):  # pylint: disable=too-many-locals
+def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals, too-many-statements
+    only_metadata: bool = False, force: bool = False, sample: bool = False,
+) -> None:
     """Loads the world bank health dataset, slices and a dashboard"""
     tbl_name = "wb_health_population"
     database = utils.get_example_database()
@@ -53,18 +53,26 @@ def load_world_bank_health_n_pop(
         data = get_example_data("countries.json.gz")
         pdf = pd.read_json(data)
         pdf.columns = [col.replace(".", "_") for col in pdf.columns]
-        pdf.year = pd.to_datetime(pdf.year)
+        if database.backend == "presto":
+            pdf.year = pd.to_datetime(pdf.year)
+            pdf.year = pdf.year.dt.strftime("%Y-%m-%d %H:%M%:%S")
+        else:
+            pdf.year = pd.to_datetime(pdf.year)
+        pdf = pdf.head(100) if sample else pdf
+
         pdf.to_sql(
             tbl_name,
             database.get_sqla_engine(),
             if_exists="replace",
             chunksize=50,
             dtype={
-                "year": DateTime(),
+                # TODO(bkyryliuk): use TIMESTAMP type for presto
+                "year": DateTime if database.backend != "presto" else String(255),
                 "country_code": String(3),
                 "country_name": String(255),
                 "region": String(255),
             },
+            method="multi",
             index=False,
         )
 
@@ -249,7 +257,7 @@ def load_world_bank_health_n_pop(
                             "AMA",
                             "PLW",
                         ],
-                        "operator": "not in",
+                        "operator": "NOT IN",
                         "subject": "country_code",
                     }
                 ],

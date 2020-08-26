@@ -16,6 +16,7 @@
 # under the License.
 import json
 import textwrap
+from typing import Dict, Union
 
 import pandas as pd
 from sqlalchemy import DateTime, String
@@ -23,6 +24,7 @@ from sqlalchemy.sql import column
 
 from superset import db, security_manager
 from superset.connectors.sqla.models import SqlMetric, TableColumn
+from superset.models.core import Database
 from superset.models.dashboard import Dashboard
 from superset.models.slice import Slice
 from superset.utils.core import get_example_database
@@ -38,38 +40,50 @@ from .helpers import (
 )
 
 
-def gen_filter(subject, comparator, operator="=="):
+def gen_filter(
+    subject: str, comparator: str, operator: str = "=="
+) -> Dict[str, Union[bool, str]]:
     return {
         "clause": "WHERE",
         "comparator": comparator,
         "expressionType": "SIMPLE",
         "operator": operator,
         "subject": subject,
-        "fromFormData": True,
     }
 
 
-def load_data(tbl_name, database):
+def load_data(tbl_name: str, database: Database, sample: bool = False) -> None:
     pdf = pd.read_json(get_example_data("birth_names.json.gz"))
-    pdf.ds = pd.to_datetime(pdf.ds, unit="ms")
+    # TODO(bkyryliuk): move load examples data into the pytest fixture
+    if database.backend == "presto":
+        pdf.ds = pd.to_datetime(pdf.ds, unit="ms")
+        pdf.ds = pdf.ds.dt.strftime("%Y-%m-%d %H:%M%:%S")
+    else:
+        pdf.ds = pd.to_datetime(pdf.ds, unit="ms")
+    pdf = pdf.head(100) if sample else pdf
+
     pdf.to_sql(
         tbl_name,
         database.get_sqla_engine(),
         if_exists="replace",
         chunksize=500,
         dtype={
-            "ds": DateTime,
+            # TODO(bkyryliuk): use TIMESTAMP type for presto
+            "ds": DateTime if database.backend != "presto" else String(255),
             "gender": String(16),
             "state": String(10),
             "name": String(255),
         },
+        method="multi",
         index=False,
     )
     print("Done loading table!")
     print("-" * 80)
 
 
-def load_birth_names(only_metadata=False, force=False):
+def load_birth_names(
+    only_metadata: bool = False, force: bool = False, sample: bool = False
+) -> None:
     """Loading birth name dataset from a zip file in the repo"""
     # pylint: disable=too-many-locals
     tbl_name = "birth_names"
@@ -77,7 +91,7 @@ def load_birth_names(only_metadata=False, force=False):
     table_exists = database.has_table_by_name(tbl_name)
 
     if not only_metadata and (not table_exists or force):
-        load_data(tbl_name, database)
+        load_data(tbl_name, database, sample=sample)
 
     obj = db.session.query(TBL).filter_by(table_name=tbl_name).first()
     if not obj:
@@ -185,7 +199,7 @@ def load_birth_names(only_metadata=False, force=False):
                         "expressionType": "SIMPLE",
                         "filterOptionName": "2745eae5",
                         "comparator": ["other"],
-                        "operator": "not in",
+                        "operator": "NOT IN",
                         "subject": "state",
                     }
                 ],

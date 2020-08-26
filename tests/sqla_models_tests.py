@@ -15,17 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 # isort:skip_file
-from typing import Dict
+from typing import Any, Dict, NamedTuple, List, Tuple, Union
+from unittest.mock import patch
+import pytest
 
+import tests.test_app
 from superset.connectors.sqla.models import SqlaTable, TableColumn
 from superset.db_engine_specs.druid import DruidEngineSpec
+from superset.exceptions import QueryObjectValidationError
 from superset.models.core import Database
-from superset.utils.core import DbColumnType, get_example_database
+from superset.utils.core import DbColumnType, get_example_database, FilterOperator
 
 from .base_tests import SupersetTestCase
 
 
-class DatabaseModelTestCase(SupersetTestCase):
+class TestDatabaseModel(SupersetTestCase):
     def test_is_time_druid_time_col(self):
         """Druid has a special __time column"""
 
@@ -46,6 +50,8 @@ class DatabaseModelTestCase(SupersetTestCase):
             "VARCHAR": DbColumnType.STRING,
             "NVARCHAR": DbColumnType.STRING,
             "STRING": DbColumnType.STRING,
+            "TEXT": DbColumnType.STRING,
+            "NTEXT": DbColumnType.STRING,
             # numeric
             "INT": DbColumnType.NUMERIC,
             "BIGINT": DbColumnType.NUMERIC,
@@ -66,14 +72,10 @@ class DatabaseModelTestCase(SupersetTestCase):
             self.assertEqual(col.is_numeric, db_col_type == DbColumnType.NUMERIC)
             self.assertEqual(col.is_string, db_col_type == DbColumnType.STRING)
 
-    def test_has_extra_cache_keys(self):
-        query = "SELECT '{{ cache_key_wrapper('user_1') }}' as user"
-        table = SqlaTable(
-            table_name="test_has_extra_cache_keys_table",
-            sql=query,
-            database=get_example_database(),
-        )
-        query_obj = {
+    @patch("superset.jinja_context.g")
+    def test_extra_cache_keys(self, flask_g):
+        flask_g.user.username = "abc"
+        base_query_obj = {
             "granularity": None,
             "from_dttm": None,
             "to_dttm": None,
@@ -81,19 +83,97 @@ class DatabaseModelTestCase(SupersetTestCase):
             "metrics": [],
             "is_timeseries": False,
             "filter": [],
-            "extras": {"where": "(user != '{{ cache_key_wrapper('user_2') }}')"},
         }
-        extra_cache_keys = table.get_extra_cache_keys(query_obj)
-        self.assertTrue(table.has_calls_to_cache_key_wrapper(query_obj))
-        self.assertListEqual(extra_cache_keys, ["user_1", "user_2"])
 
-    def test_has_no_extra_cache_keys(self):
+        # Table with Jinja callable.
+        table = SqlaTable(
+            table_name="test_has_extra_cache_keys_table",
+            sql="SELECT '{{ current_username() }}' as user",
+            database=get_example_database(),
+        )
+
+        query_obj = dict(**base_query_obj, extras={})
+        extra_cache_keys = table.get_extra_cache_keys(query_obj)
+        self.assertTrue(table.has_extra_cache_key_calls(query_obj))
+        # TODO(bkyryliuk): make it work with presto
+        if get_example_database().backend == "presto":
+            assert extra_cache_keys == []
+        else:
+            assert extra_cache_keys == ["abc"]
+
+        # Table with Jinja callable disabled.
+        table = SqlaTable(
+            table_name="test_has_extra_cache_keys_disabled_table",
+            sql="SELECT '{{ current_username(False) }}' as user",
+            database=get_example_database(),
+        )
+        query_obj = dict(**base_query_obj, extras={})
+        extra_cache_keys = table.get_extra_cache_keys(query_obj)
+        self.assertTrue(table.has_extra_cache_key_calls(query_obj))
+        self.assertListEqual(extra_cache_keys, [])
+
+        # Table with no Jinja callable.
         query = "SELECT 'abc' as user"
         table = SqlaTable(
             table_name="test_has_no_extra_cache_keys_table",
             sql=query,
             database=get_example_database(),
         )
+
+        query_obj = dict(**base_query_obj, extras={"where": "(user != 'abc')"})
+        extra_cache_keys = table.get_extra_cache_keys(query_obj)
+        self.assertFalse(table.has_extra_cache_key_calls(query_obj))
+        self.assertListEqual(extra_cache_keys, [])
+
+        # With Jinja callable in SQL expression.
+        query_obj = dict(
+            **base_query_obj, extras={"where": "(user != '{{ current_username() }}')"}
+        )
+        extra_cache_keys = table.get_extra_cache_keys(query_obj)
+        self.assertTrue(table.has_extra_cache_key_calls(query_obj))
+        # TODO(bkyryliuk): make it work with presto
+        if get_example_database().backend == "presto":
+            assert extra_cache_keys == []
+        else:
+            assert extra_cache_keys == ["abc"]
+
+    def test_where_operators(self):
+        class FilterTestCase(NamedTuple):
+            operator: str
+            value: Union[float, int, List[Any], str]
+            expected: str
+
+        filters: Tuple[FilterTestCase, ...] = (
+            FilterTestCase(FilterOperator.IS_NULL, "", "IS NULL"),
+            FilterTestCase(FilterOperator.IS_NOT_NULL, "", "IS NOT NULL"),
+            FilterTestCase(FilterOperator.GREATER_THAN, 0, "> 0"),
+            FilterTestCase(FilterOperator.GREATER_THAN_OR_EQUALS, 0, ">= 0"),
+            FilterTestCase(FilterOperator.LESS_THAN, 0, "< 0"),
+            FilterTestCase(FilterOperator.LESS_THAN_OR_EQUALS, 0, "<= 0"),
+            FilterTestCase(FilterOperator.EQUALS, 0, "= 0"),
+            FilterTestCase(FilterOperator.NOT_EQUALS, 0, "!= 0"),
+            FilterTestCase(FilterOperator.IN, ["1", "2"], "IN (1, 2)"),
+            FilterTestCase(FilterOperator.NOT_IN, ["1", "2"], "NOT IN (1, 2)"),
+        )
+        table = self.get_table_by_name("birth_names")
+        for filter_ in filters:
+            query_obj = {
+                "granularity": None,
+                "from_dttm": None,
+                "to_dttm": None,
+                "groupby": ["gender"],
+                "metrics": ["count"],
+                "is_timeseries": False,
+                "filter": [
+                    {"col": "num", "op": filter_.operator, "val": filter_.value}
+                ],
+                "extras": {},
+            }
+            sqla_query = table.get_sqla_query(**query_obj)
+            sql = table.database.compile_sqla_query(sqla_query.sqla_query)
+            self.assertIn(filter_.expected, sql)
+
+    def test_incorrect_jinja_syntax_raises_correct_exception(self):
         query_obj = {
             "granularity": None,
             "from_dttm": None,
@@ -102,8 +182,16 @@ class DatabaseModelTestCase(SupersetTestCase):
             "metrics": [],
             "is_timeseries": False,
             "filter": [],
-            "extras": {"where": "(user != 'abc')"},
+            "extras": {},
         }
-        extra_cache_keys = table.get_extra_cache_keys(query_obj)
-        self.assertFalse(table.has_calls_to_cache_key_wrapper(query_obj))
-        self.assertListEqual(extra_cache_keys, [])
+
+        # Table with Jinja callable.
+        table = SqlaTable(
+            table_name="test_table",
+            sql="SELECT '{{ abcd xyz + 1 ASDF }}' as user",
+            database=get_example_database(),
+        )
+        # TODO(villebro): make it work with presto
+        if get_example_database().backend != "presto":
+            with pytest.raises(QueryObjectValidationError):
+                table.get_sqla_query(**query_obj)

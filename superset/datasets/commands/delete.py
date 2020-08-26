@@ -17,11 +17,13 @@
 import logging
 from typing import Optional
 
+from flask_appbuilder.models.sqla import Model
 from flask_appbuilder.security.sqla.models import User
+from sqlalchemy.exc import SQLAlchemyError
 
 from superset.commands.base import BaseCommand
-from superset.commands.exceptions import DeleteFailedError
 from superset.connectors.sqla.models import SqlaTable
+from superset.dao.exceptions import DAODeleteFailedError
 from superset.datasets.commands.exceptions import (
     DatasetDeleteFailedError,
     DatasetForbiddenError,
@@ -29,6 +31,7 @@ from superset.datasets.commands.exceptions import (
 )
 from superset.datasets.dao import DatasetDAO
 from superset.exceptions import SupersetSecurityException
+from superset.extensions import db, security_manager
 from superset.views.base import check_ownership
 
 logger = logging.getLogger(__name__)
@@ -40,12 +43,34 @@ class DeleteDatasetCommand(BaseCommand):
         self._model_id = model_id
         self._model: Optional[SqlaTable] = None
 
-    def run(self):
+    def run(self) -> Model:
         self.validate()
         try:
-            dataset = DatasetDAO.delete(self._model)
-        except DeleteFailedError as e:
-            logger.exception(e.exception)
+            view_menu = (
+                security_manager.find_view_menu(self._model.get_perm())
+                if self._model
+                else None
+            )
+            if not view_menu:
+                logger.error(
+                    "Could not find the data access permission for the dataset"
+                )
+                raise DatasetDeleteFailedError()
+            permission_views = (
+                db.session.query(security_manager.permissionview_model)
+                .filter_by(view_menu=view_menu)
+                .all()
+            )
+            dataset = DatasetDAO.delete(self._model, commit=False)
+
+            for permission_view in permission_views:
+                db.session.delete(permission_view)
+            if view_menu:
+                db.session.delete(view_menu)
+            db.session.commit()
+        except (SQLAlchemyError, DAODeleteFailedError) as ex:
+            logger.exception(ex)
+            db.session.rollback()
             raise DatasetDeleteFailedError()
         return dataset
 

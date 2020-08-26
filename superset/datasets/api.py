@@ -15,10 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 import logging
+from typing import Any
 
+import yaml
 from flask import g, request, Response
-from flask_appbuilder.api import expose, protect, safe
+from flask_appbuilder.api import expose, protect, rison, safe
 from flask_appbuilder.models.sqla.interface import SQLAInterface
+from marshmallow import ValidationError
 
 from superset.connectors.sqla.models import SqlaTable
 from superset.constants import RouteMethod
@@ -30,13 +33,26 @@ from superset.datasets.commands.exceptions import (
     DatasetForbiddenError,
     DatasetInvalidError,
     DatasetNotFoundError,
+    DatasetRefreshFailedError,
     DatasetUpdateFailedError,
 )
+from superset.datasets.commands.refresh import RefreshDatasetCommand
 from superset.datasets.commands.update import UpdateDatasetCommand
-from superset.datasets.schemas import DatasetPostSchema, DatasetPutSchema
-from superset.views.base import DatasourceFilter
-from superset.views.base_api import BaseSupersetModelRestApi
+from superset.datasets.dao import DatasetDAO
+from superset.datasets.schemas import (
+    DatasetPostSchema,
+    DatasetPutSchema,
+    DatasetRelatedObjectsResponse,
+    get_export_ids_schema,
+)
+from superset.views.base import DatasourceFilter, generate_download_headers
+from superset.views.base_api import (
+    BaseSupersetModelRestApi,
+    RelatedFieldFilter,
+    statsd_metrics,
+)
 from superset.views.database.filters import DatabaseFilter
+from superset.views.filters import FilterRelatedOwners
 
 logger = logging.getLogger(__name__)
 
@@ -47,22 +63,45 @@ class DatasetRestApi(BaseSupersetModelRestApi):
 
     resource_name = "dataset"
     allow_browser_login = True
-
     class_permission_name = "TableModelView"
-    include_route_methods = RouteMethod.REST_MODEL_VIEW_CRUD_SET | {RouteMethod.RELATED}
-
+    include_route_methods = RouteMethod.REST_MODEL_VIEW_CRUD_SET | {
+        RouteMethod.EXPORT,
+        RouteMethod.RELATED,
+        RouteMethod.DISTINCT,
+        "refresh",
+        "related_objects",
+    }
     list_columns = [
+        "id",
+        "database.id",
+        "database.database_name",
         "changed_by_name",
         "changed_by_url",
+        "changed_by.first_name",
         "changed_by.username",
-        "changed_on",
-        "database_name",
+        "changed_on_utc",
+        "changed_on_delta_humanized",
+        "default_endpoint",
         "explore_url",
-        "id",
+        "kind",
+        "owners.id",
+        "owners.username",
+        "owners.first_name",
+        "owners.last_name",
         "schema",
+        "sql",
         "table_name",
     ]
+    list_select_columns = list_columns + ["changed_on", "changed_by_fk"]
+    order_columns = [
+        "table_name",
+        "schema",
+        "changed_by.first_name",
+        "changed_on_delta_humanized",
+        "database.database_name",
+    ]
     show_columns = [
+        "id",
         "database.database_name",
         "database.id",
         "table_name",
@@ -79,6 +118,12 @@ class DatasetRestApi(BaseSupersetModelRestApi):
         "template_params",
         "owners.id",
         "owners.username",
+        "owners.first_name",
+        "owners.last_name",
+        "columns",
+        "metrics",
+        "datasource_type",
+        "url",
     ]
     add_model_schema = DatasetPostSchema()
     edit_model_schema = DatasetPutSchema()
@@ -97,16 +142,24 @@ class DatasetRestApi(BaseSupersetModelRestApi):
         "is_sqllab_view",
         "template_params",
         "owners",
+        "columns",
+        "metrics",
     ]
     openapi_spec_tag = "Datasets"
-
-    filter_rel_fields_field = {"owners": "first_name", "database": "database_name"}
+    related_field_filters = {
+        "owners": RelatedFieldFilter("first_name", FilterRelatedOwners),
+        "database": "database_name",
+    }
     filter_rel_fields = {"database": [["id", DatabaseFilter, lambda: []]]}
     allowed_rel_fields = {"database", "owners"}
+    allowed_distinct_fields = {"schema"}
+
+    openapi_spec_component_schemas = (DatasetRelatedObjectsResponse,)
 
     @expose("/", methods=["POST"])
     @protect()
     @safe
+    @statsd_metrics
     def post(self) -> Response:
         """Creates a new Dataset
         ---
@@ -143,22 +196,26 @@ class DatasetRestApi(BaseSupersetModelRestApi):
         """
         if not request.is_json:
             return self.response_400(message="Request is not JSON")
-        item = self.add_model_schema.load(request.json)
-        # This validates custom Schema with custom validations
-        if item.errors:
-            return self.response_400(message=item.errors)
         try:
-            new_model = CreateDatasetCommand(g.user, item.data).run()
-            return self.response(201, id=new_model.id, result=item.data)
-        except DatasetInvalidError as e:
-            return self.response_422(message=e.normalized_messages())
-        except DatasetCreateFailedError as e:
-            logger.error(f"Error creating model {self.__class__.__name__}: {e}")
-            return self.response_422(message=str(e))
+            item = self.add_model_schema.load(request.json)
+        # This validates custom Schema with custom validations
+        except ValidationError as error:
+            return self.response_400(message=error.messages)
+        try:
+            new_model = CreateDatasetCommand(g.user, item).run()
+            return self.response(201, id=new_model.id, result=item)
+        except DatasetInvalidError as ex:
+            return self.response_422(message=ex.normalized_messages())
+        except DatasetCreateFailedError as ex:
+            logger.error(
+                "Error creating model %s: %s", self.__class__.__name__, str(ex)
+            )
+            return self.response_422(message=str(ex))
 
     @expose("/<pk>", methods=["PUT"])
     @protect()
     @safe
+    @statsd_metrics
     def put(  # pylint: disable=too-many-return-statements, arguments-differ
         self, pk: int
     ) -> Response:
@@ -206,26 +263,30 @@ class DatasetRestApi(BaseSupersetModelRestApi):
         """
         if not request.is_json:
             return self.response_400(message="Request is not JSON")
-        item = self.edit_model_schema.load(request.json)
-        # This validates custom Schema with custom validations
-        if item.errors:
-            return self.response_400(message=item.errors)
         try:
-            changed_model = UpdateDatasetCommand(g.user, pk, item.data).run()
-            return self.response(200, id=changed_model.id, result=item.data)
+            item = self.edit_model_schema.load(request.json)
+        # This validates custom Schema with custom validations
+        except ValidationError as error:
+            return self.response_400(message=error.messages)
+        try:
+            changed_model = UpdateDatasetCommand(g.user, pk, item).run()
+            return self.response(200, id=changed_model.id, result=item)
         except DatasetNotFoundError:
             return self.response_404()
         except DatasetForbiddenError:
             return self.response_403()
-        except DatasetInvalidError as e:
-            return self.response_422(message=e.normalized_messages())
-        except DatasetUpdateFailedError as e:
-            logger.error(f"Error updating model {self.__class__.__name__}: {e}")
-            return self.response_422(message=str(e))
+        except DatasetInvalidError as ex:
+            return self.response_422(message=ex.normalized_messages())
+        except DatasetUpdateFailedError as ex:
+            logger.error(
+                "Error updating model %s: %s", self.__class__.__name__, str(ex)
+            )
+            return self.response_422(message=str(ex))
 
     @expose("/<pk>", methods=["DELETE"])
     @protect()
     @safe
+    @statsd_metrics
     def delete(self, pk: int) -> Response:  # pylint: disable=arguments-differ
         """Deletes a Dataset
         ---
@@ -265,6 +326,167 @@ class DatasetRestApi(BaseSupersetModelRestApi):
             return self.response_404()
         except DatasetForbiddenError:
             return self.response_403()
-        except DatasetDeleteFailedError as e:
-            logger.error(f"Error deleting model {self.__class__.__name__}: {e}")
-            return self.response_422(message=str(e))
+        except DatasetDeleteFailedError as ex:
+            logger.error(
+                "Error deleting model %s: %s", self.__class__.__name__, str(ex)
+            )
+            return self.response_422(message=str(ex))
+
+    @expose("/export/", methods=["GET"])
+    @protect()
+    @safe
+    @statsd_metrics
+    @rison(get_export_ids_schema)
+    def export(self, **kwargs: Any) -> Response:
+        """Export dashboards
+        ---
+        get:
+          description: >-
+            Exports multiple datasets and downloads them as YAML files
+          parameters:
+          - in: query
+            name: q
+            content:
+              application/json:
+                schema:
+                  type: array
+                  items:
+                    type: integer
+          responses:
+            200:
+              description: Dataset export
+              content:
+                text/plain:
+                  schema:
+                    type: string
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        requested_ids = kwargs["rison"]
+        query = self.datamodel.session.query(SqlaTable).filter(
+            SqlaTable.id.in_(requested_ids)
+        )
+        query = self._base_filters.apply_all(query)
+        items = query.all()
+        ids = [item.id for item in items]
+        if len(ids) != len(requested_ids):
+            return self.response_404()
+
+        data = [t.export_to_dict() for t in items]
+        return Response(
+            yaml.safe_dump(data),
+            headers=generate_download_headers("yaml"),
+            mimetype="application/text",
+        )
+
+    @expose("/<pk>/refresh", methods=["PUT"])
+    @protect()
+    @safe
+    @statsd_metrics
+    def refresh(self, pk: int) -> Response:
+        """Refresh a Dataset
+        ---
+        put:
+          description: >-
+            Refreshes and updates columns of a dataset
+          parameters:
+          - in: path
+            schema:
+              type: integer
+            name: pk
+          responses:
+            200:
+              description: Dataset delete
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      message:
+                        type: string
+            401:
+              $ref: '#/components/responses/401'
+            403:
+              $ref: '#/components/responses/403'
+            404:
+              $ref: '#/components/responses/404'
+            422:
+              $ref: '#/components/responses/422'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        try:
+            RefreshDatasetCommand(g.user, pk).run()
+            return self.response(200, message="OK")
+        except DatasetNotFoundError:
+            return self.response_404()
+        except DatasetForbiddenError:
+            return self.response_403()
+        except DatasetRefreshFailedError as ex:
+            logger.error(
+                "Error refreshing dataset %s: %s", self.__class__.__name__, str(ex)
+            )
+            return self.response_422(message=str(ex))
+
+    @expose("/<pk>/related_objects", methods=["GET"])
+    @protect()
+    @safe
+    @statsd_metrics
+    def related_objects(self, pk: int) -> Response:
+        """Get charts and dashboards count associated to a dataset
+        ---
+        get:
+          description:
+            Get charts and dashboards count associated to a dataset
+          parameters:
+          - in: path
+            name: pk
+            schema:
+              type: integer
+          responses:
+            200:
+            200:
+              description: Query result
+              content:
+                application/json:
+                  schema:
+                    $ref: "#/components/schemas/DatasetRelatedObjectsResponse"
+            401:
+              $ref: '#/components/responses/401'
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        dataset = DatasetDAO.find_by_id(pk)
+        if not dataset:
+            return self.response_404()
+        data = DatasetDAO.get_related_objects(pk)
+        charts = [
+            {
+                "id": chart.id,
+                "slice_name": chart.slice_name,
+                "viz_type": chart.viz_type,
+            }
+            for chart in data["charts"]
+        ]
+        dashboards = [
+            {
+                "id": dashboard.id,
+                "json_metadata": dashboard.json_metadata,
+                "slug": dashboard.slug,
+                "title": dashboard.dashboard_title,
+            }
+            for dashboard in data["dashboards"]
+        ]
+        return self.response(
+            200,
+            charts={"count": len(charts), "result": charts},
+            dashboards={"count": len(dashboards), "result": dashboards},
+        )

@@ -33,8 +33,9 @@ import {
   updateComponents,
   handleComponentDrop,
 } from '../actions/dashboardLayout';
-import { setDirectPathToChild } from '../actions/dashboardState';
+import { setDirectPathToChild, setMountedTab } from '../actions/dashboardState';
 import { logEvent } from '../../logger/actions';
+import { addDangerToast } from '../../messageToasts/actions';
 
 const propTypes = {
   component: componentShape.isRequired,
@@ -66,6 +67,8 @@ function mapStateToProps(
     component,
     parentComponent: dashboardLayout[parentId],
     editMode: dashboardState.editMode,
+    undoLength: undoableLayout.past.length,
+    redoLength: undoableLayout.future.length,
     filters: getActiveFilters(),
     directPathToChild: dashboardState.directPathToChild,
     directPathLastUpdated: dashboardState.directPathLastUpdated,
@@ -97,11 +100,13 @@ function mapStateToProps(
 function mapDispatchToProps(dispatch) {
   return bindActionCreators(
     {
+      addDangerToast,
       createComponent,
       deleteComponent,
       updateComponents,
       handleComponentDrop,
       setDirectPathToChild,
+      setMountedTab,
       logEvent,
     },
     dispatch,

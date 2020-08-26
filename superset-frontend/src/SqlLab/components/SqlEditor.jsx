@@ -24,7 +24,6 @@ import {
   InputGroup,
   Form,
   FormControl,
-  Label,
   OverlayTrigger,
   Tooltip,
 } from 'react-bootstrap';
@@ -33,7 +32,12 @@ import { t } from '@superset-ui/translation';
 import debounce from 'lodash/debounce';
 import throttle from 'lodash/throttle';
 
-import Button from '../../components/Button';
+import Label from 'src/components/Label';
+import Button from 'src/components/Button';
+import Checkbox from 'src/components/Checkbox';
+import Timer from 'src/components/Timer';
+import Hotkeys from 'src/components/Hotkeys';
+
 import LimitControl from './LimitControl';
 import TemplateParamsEditor from './TemplateParamsEditor';
 import SouthPane from './SouthPane';
@@ -41,8 +45,6 @@ import SaveQuery from './SaveQuery';
 import ScheduleQueryButton from './ScheduleQueryButton';
 import EstimateQueryCostButton from './EstimateQueryCostButton';
 import ShareSqlLabQuery from './ShareSqlLabQuery';
-import Timer from '../../components/Timer';
-import Hotkeys from '../../components/Hotkeys';
 import SqlEditorLeftBar from './SqlEditorLeftBar';
 import AceEditorWrapper from './AceEditorWrapper';
 import {
@@ -53,6 +55,7 @@ import {
 } from '../constants';
 import RunQueryActionButton from './RunQueryActionButton';
 import { FeatureFlag, isFeatureEnabled } from '../../featureFlags';
+import { CtasEnum } from '../actions/sqlLab';
 
 const SQL_EDITOR_PADDING = 10;
 const INITIAL_NORTH_PERCENT = 30;
@@ -93,6 +96,7 @@ class SqlEditor extends React.PureComponent {
       northPercent: props.queryEditor.northPercent || INITIAL_NORTH_PERCENT,
       southPercent: props.queryEditor.southPercent || INITIAL_SOUTH_PERCENT,
       sql: props.queryEditor.sql,
+      autocompleteEnabled: true,
     };
     this.sqlEditorRef = React.createRef();
     this.northPaneRef = React.createRef();
@@ -245,10 +249,14 @@ class SqlEditor extends React.PureComponent {
   handleWindowResize() {
     this.setState({ height: this.getSqlEditorHeight() });
   }
+  handleToggleAutocompleteEnabled = () => {
+    this.setState({ autocompleteEnabled: !this.state.autocompleteEnabled });
+  };
   elementStyle(dimension, elementSize, gutterSize) {
     return {
-      [dimension]: `calc(${elementSize}% - ${gutterSize +
-        SQL_EDITOR_GUTTER_MARGIN}px)`,
+      [dimension]: `calc(${elementSize}% - ${
+        gutterSize + SQL_EDITOR_GUTTER_MARGIN
+      }px)`,
     };
   }
   requestValidation() {
@@ -278,7 +286,7 @@ class SqlEditor extends React.PureComponent {
       this.startQuery();
     }
   }
-  startQuery(ctas = false) {
+  startQuery(ctas = false, ctas_method = CtasEnum.TABLE) {
     const qe = this.props.queryEditor;
     const query = {
       dbId: qe.dbId,
@@ -286,13 +294,14 @@ class SqlEditor extends React.PureComponent {
       sqlEditorId: qe.id,
       tab: qe.title,
       schema: qe.schema,
-      tempTableName: ctas ? this.state.ctas : '',
+      tempTable: ctas ? this.state.ctas : '',
       templateParams: qe.templateParams,
       queryLimit: qe.queryLimit || this.props.defaultQueryLimit,
       runAsync: this.props.database
         ? this.props.database.allow_run_async
         : false,
       ctas,
+      ctas_method,
       updateTabState: !qe.selectedText,
     };
     this.props.actions.runQuery(query);
@@ -307,7 +316,10 @@ class SqlEditor extends React.PureComponent {
     }
   }
   createTableAs() {
-    this.startQuery(true);
+    this.startQuery(true, CtasEnum.TABLE);
+  }
+  createViewAs() {
+    this.startQuery(true, CtasEnum.VIEW);
   }
   ctasChanged(event) {
     this.setState({ ctas: event.target.value });
@@ -337,6 +349,7 @@ class SqlEditor extends React.PureComponent {
         <div ref={this.northPaneRef} className="north-pane">
           <AceEditorWrapper
             actions={this.props.actions}
+            autocomplete={this.state.autocompleteEnabled}
             onBlur={this.setQueryEditorSql}
             onChange={this.onSqlChanged}
             queryEditor={this.props.queryEditor}
@@ -365,8 +378,13 @@ class SqlEditor extends React.PureComponent {
   }
   renderEditorBottomBar(hotkeys) {
     let ctasControls;
-    if (this.props.database && this.props.database.allow_ctas) {
+    if (
+      this.props.database &&
+      (this.props.database.allow_ctas || this.props.database.allow_cvas)
+    ) {
       const ctasToolTip = t('Create table as with query results');
+      const cvasToolTip = t('Create view as with query results');
+
       ctasControls = (
         <FormGroup>
           <InputGroup>
@@ -378,14 +396,26 @@ class SqlEditor extends React.PureComponent {
               onChange={this.ctasChanged.bind(this)}
             />
             <InputGroup.Button>
-              <Button
-                bsSize="small"
-                disabled={this.state.ctas.length === 0}
-                onClick={this.createTableAs.bind(this)}
-                tooltip={ctasToolTip}
-              >
-                <i className="fa fa-table" /> CTAS
-              </Button>
+              {this.props.database.allow_ctas && (
+                <Button
+                  bsSize="small"
+                  disabled={this.state.ctas.length === 0}
+                  onClick={this.createTableAs.bind(this)}
+                  tooltip={ctasToolTip}
+                >
+                  <i className="fa fa-table" /> CTAS
+                </Button>
+              )}
+              {this.props.database.allow_cvas && (
+                <Button
+                  bsSize="small"
+                  disabled={this.state.ctas.length === 0}
+                  onClick={this.createViewAs.bind(this)}
+                  tooltip={cvasToolTip}
+                >
+                  <i className="fa fa-table" /> CVAS
+                </Button>
+              )}
             </InputGroup.Button>
           </InputGroup>
         </FormGroup>
@@ -502,6 +532,13 @@ class SqlEditor extends React.PureComponent {
           </Form>
         </div>
         <div className="rightItems">
+          <Button
+            className="autocomplete"
+            onClick={this.handleToggleAutocompleteEnabled}
+          >
+            <Checkbox checked={this.state.autocompleteEnabled} />{' '}
+            {t('Autocomplete')}
+          </Button>{' '}
           <TemplateParamsEditor
             language="json"
             onChange={params => {
